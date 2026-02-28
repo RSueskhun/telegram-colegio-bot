@@ -8,6 +8,9 @@ from googleapiclient.discovery import build
 
 app = FastAPI()
 
+MAILER_URL = os.environ.get("MAILER_URL", "")
+MAILER_SECRET = os.environ.get("MAILER_SECRET", "")
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 SHEET_ID = os.environ.get("SHEET_ID", "")
 SHEETS_SA_JSON = os.environ.get("SHEETS_SA_JSON", "")
@@ -151,6 +154,44 @@ def inline_keyboard(buttons, cols=2):
     return {"inline_keyboard": rows}
 
 
+# ---------- Mailer (Apps Script) ----------
+def send_via_mailer(to_emails: list[str], subject: str, body_text: str):
+    if not MAILER_URL or not MAILER_SECRET:
+        raise ValueError("Falta MAILER_URL o MAILER_SECRET en Railway")
+
+    to_emails = [e.strip() for e in to_emails if e and e.strip()]
+    if not to_emails:
+        raise ValueError("No hay destinatarios")
+
+    payload = {
+        "secret": MAILER_SECRET,
+        "to": ",".join(to_emails),
+        "subject": subject.strip() if subject else "(sin asunto)",
+        "text": body_text or "",
+        "html": (body_text or "").replace("\n", "<br>"),
+    }
+
+    r = requests.post(MAILER_URL, json=payload, timeout=25)
+
+    # Apps Script a veces responde JSON, a veces texto.
+    try:
+        resp = r.json()
+    except Exception:
+        resp = {"raw": r.text}
+
+    if not r.ok:
+        raise ValueError(f"Mailer HTTP {r.status_code}: {resp}")
+
+    if resp.get("ok") is True:
+        return True
+
+    # Si no trae ok, pero trae statusCode 200 y no error, aceptamos.
+    if resp.get("statusCode") == 200 and not resp.get("error"):
+        return True
+
+    raise ValueError(resp.get("error") or f"Respuesta inesperada del mailer: {resp}")
+
+
 # ---------- Bot flow ----------
 def start_flow(chat_id: int, user_id: int):
     directorio = load_directorio()
@@ -254,7 +295,7 @@ def pick_template(chat_id: int, user_id: int, plantilla_id: str):
         inline_keyboard([
             {"text": "✏️ Editar asunto", "data": "EA"},
             {"text": "✏️ Editar cuerpo", "data": "EC"},
-            {"text": "✅ (Luego) Enviar", "data": "SEND"},
+            {"text": "✅ Enviar", "data": "SEND"},
             {"text": "❌ Cancelar", "data": "CANCEL"},
         ], cols=1),
     )
@@ -285,23 +326,39 @@ async def telegram_webhook(request: Request):
                 pick_student(chat_id, user_id, curso, estudiante)
             elif payload.startswith("T|"):
                 pick_template(chat_id, user_id, payload.split("|", 1)[1])
+
             elif payload == "EA":
                 st = STATE.get(user_id, {})
                 st["step"] = "WAIT_ASUNTO"
                 STATE[user_id] = st
                 send_message(chat_id, "Escribe el asunto final:")
+
             elif payload == "EC":
                 st = STATE.get(user_id, {})
                 st["step"] = "WAIT_CUERPO"
                 STATE[user_id] = st
                 send_message(chat_id, "Pega/escribe el cuerpo final del correo:")
+
             elif payload == "CANCEL":
                 STATE.pop(user_id, None)
                 send_message(chat_id, "Cancelado. Usa /enviar para empezar de nuevo.")
+
             elif payload == "SEND":
-                send_message(chat_id, "Perfecto. El flujo está listo ✅\nSiguiente paso: conectar el envío con tu Gmail institucional.")
+                st = STATE.get(user_id, {})
+                to_list = [st.get("padre_email", ""), st.get("madre_email", "")]
+                to_list = [e for e in to_list if e and e.strip()]
+                if not to_list:
+                    send_message(chat_id, "No hay correos de destino (padre/madre).")
+                    return {"status": "ok"}
+
+                subject = st.get("asunto", "(sin asunto)")
+                body = st.get("cuerpo", "")
+
+                send_via_mailer(to_list, subject, body)
+                send_message(chat_id, f"✅ Enviado a: {', '.join(to_list)}")
+
         except Exception as e:
-            send_message(chat_id, f"Error interno: {e}")
+            send_message(chat_id, f"❌ Error: {e}")
 
         return {"status": "ok"}
 
@@ -322,19 +379,20 @@ async def telegram_webhook(request: Request):
                 send_message(chat_id, f"Error leyendo Google Sheets: {e}")
             return {"status": "ok"}
 
+        # Edición manual (MVP)
         st = STATE.get(user_id, {})
         if st.get("step") == "WAIT_ASUNTO":
             st["asunto"] = text
             st["step"] = "PREVIEW"
             STATE[user_id] = st
-            send_message(chat_id, "Listo (edición de asunto pendiente de ajustar). Usa /enviar por ahora.")
+            send_message(chat_id, "✅ Asunto actualizado. Ahora pulsa ✅ Enviar en la vista previa (o /enviar para reiniciar).")
             return {"status": "ok"}
 
         if st.get("step") == "WAIT_CUERPO":
             st["cuerpo"] = text
             st["step"] = "PREVIEW"
             STATE[user_id] = st
-            send_message(chat_id, "Listo (edición de cuerpo pendiente de ajustar). Usa /enviar por ahora.")
+            send_message(chat_id, "✅ Cuerpo actualizado. Ahora pulsa ✅ Enviar en la vista previa (o /enviar para reiniciar).")
             return {"status": "ok"}
 
         send_message(chat_id, "Usa /enviar para iniciar.")
