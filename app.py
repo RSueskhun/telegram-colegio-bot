@@ -8,20 +8,33 @@ from googleapiclient.discovery import build
 
 app = FastAPI()
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-SHEET_ID = os.environ["SHEET_ID"]
-SHEETS_SA_JSON = os.environ["SHEETS_SA_JSON"]
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+SHEET_ID = os.environ.get("SHEET_ID", "")
+SHEETS_SA_JSON = os.environ.get("SHEETS_SA_JSON", "")
 
 DIRECTORIO_TAB = os.environ.get("DIRECTORIO_TAB", "DIRECTORIO")
 PLANTILLAS_TAB = os.environ.get("PLANTILLAS_TAB", "PLANTILLAS")
 
-# Estado simple en memoria (para 1 usuario va perfecto). Más adelante lo pasamos a DB/Redis.
 STATE = {}  # key: user_id -> dict
+
+
+@app.get("/")
+def health_check():
+    return {"status": "server running"}
 
 
 # ---------- Google Sheets client ----------
 def sheets_client():
-    sa_info = json.loads(SHEETS_SA_JSON)
+    if not SHEETS_SA_JSON:
+        raise ValueError("SHEETS_SA_JSON no configurado")
+    if not SHEET_ID:
+        raise ValueError("SHEET_ID no configurado")
+
+    try:
+        sa_info = json.loads(SHEETS_SA_JSON)
+    except Exception as e:
+        raise ValueError(f"Error parseando SHEETS_SA_JSON: {e}")
+
     creds = Credentials.from_service_account_info(
         sa_info,
         scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"],
@@ -58,14 +71,16 @@ def load_directorio():
     for row in rows:
         def get(col):
             i = idx[col]
-            return (row[i].strip() if i < len(row) and isinstance(row[i], str) else (row[i] if i < len(row) else "")) or ""
+            if i < len(row) and isinstance(row[i], str):
+                return row[i].strip()
+            return str(row[i]).strip() if i < len(row) else ""
         out.append({
-            "CURSO": str(get("CURSO")).strip(),
-            "ESTUDIANTE": str(get("ESTUDIANTE")).strip(),
-            "PADRE_NOMBRE": str(get("PADRE_NOMBRE")).strip(),
-            "PADRE_EMAIL": str(get("PADRE_EMAIL")).strip(),
-            "MADRE_NOMBRE": str(get("MADRE_NOMBRE")).strip(),
-            "MADRE_EMAIL": str(get("MADRE_EMAIL")).strip(),
+            "CURSO": get("CURSO"),
+            "ESTUDIANTE": get("ESTUDIANTE"),
+            "PADRE_NOMBRE": get("PADRE_NOMBRE"),
+            "PADRE_EMAIL": get("PADRE_EMAIL"),
+            "MADRE_NOMBRE": get("MADRE_NOMBRE"),
+            "MADRE_EMAIL": get("MADRE_EMAIL"),
         })
     return out
 
@@ -82,13 +97,15 @@ def load_plantillas():
     for row in rows:
         def get(col):
             i = idx[col]
-            return (row[i].strip() if i < len(row) and isinstance(row[i], str) else (row[i] if i < len(row) else "")) or ""
-        pid = str(get("PLANTILLA_ID")).strip()
+            if i < len(row) and isinstance(row[i], str):
+                return row[i].strip()
+            return str(row[i]).strip() if i < len(row) else ""
+        pid = get("PLANTILLA_ID")
         if pid:
             out.append({
                 "PLANTILLA_ID": pid,
-                "ASUNTO": str(get("ASUNTO")),
-                "CUERPO": str(get("CUERPO")),
+                "ASUNTO": get("ASUNTO"),
+                "CUERPO": get("CUERPO"),
             })
     return out
 
@@ -103,6 +120,8 @@ def render_vars(text: str, data: dict) -> str:
 
 # ---------- Telegram helpers ----------
 def tg(method: str, payload: dict):
+    if not TELEGRAM_TOKEN:
+        raise ValueError("TELEGRAM_TOKEN no configurado")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
     r = requests.post(url, json=payload, timeout=15)
     return r.json()
@@ -218,7 +237,7 @@ def pick_template(chat_id: int, user_id: int, plantilla_id: str):
     })
     STATE[user_id] = st
 
-    destinos = ", ".join([e for e in [st.get("padre_email",""), st.get("madre_email","")] if e]) or "(sin destinatarios)"
+    destinos = ", ".join([e for e in [st.get("padre_email", ""), st.get("madre_email", "")] if e]) or "(sin destinatarios)"
     preview = (
         "📌 Vista previa\n\n"
         f"Curso: {st.get('curso')}\n"
@@ -244,9 +263,11 @@ def pick_template(chat_id: int, user_id: int, plantilla_id: str):
 # ---------- Webhook ----------
 @app.post("/")
 async def telegram_webhook(request: Request):
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return {"status": "ok"}
 
-    # Callback buttons
     if "callback_query" in data:
         cq = data["callback_query"]
         callback_id = cq["id"]
@@ -256,45 +277,49 @@ async def telegram_webhook(request: Request):
 
         answer_callback(callback_id)
 
-        if payload.startswith("C|"):
-            pick_course(chat_id, user_id, payload.split("|", 1)[1])
-        elif payload.startswith("S|"):
-            _, curso, estudiante = payload.split("|", 2)
-            pick_student(chat_id, user_id, curso, estudiante)
-        elif payload.startswith("T|"):
-            pick_template(chat_id, user_id, payload.split("|", 1)[1])
-        elif payload == "EA":
-            st = STATE.get(user_id, {})
-            st["step"] = "WAIT_ASUNTO"
-            STATE[user_id] = st
-            send_message(chat_id, "Escribe el asunto final:")
-        elif payload == "EC":
-            st = STATE.get(user_id, {})
-            st["step"] = "WAIT_CUERPO"
-            STATE[user_id] = st
-            send_message(chat_id, "Pega/escribe el cuerpo final del correo:")
-        elif payload == "CANCEL":
-            STATE.pop(user_id, None)
-            send_message(chat_id, "Cancelado. Usa /enviar para empezar de nuevo.")
-        elif payload == "SEND":
-            # En esta fase solo confirmamos; el envío Gmail lo activamos en el siguiente paso.
-            send_message(chat_id, "Perfecto. El flujo está listo ✅\nSiguiente paso: conectar el envío con tu Gmail institucional.")
+        try:
+            if payload.startswith("C|"):
+                pick_course(chat_id, user_id, payload.split("|", 1)[1])
+            elif payload.startswith("S|"):
+                _, curso, estudiante = payload.split("|", 2)
+                pick_student(chat_id, user_id, curso, estudiante)
+            elif payload.startswith("T|"):
+                pick_template(chat_id, user_id, payload.split("|", 1)[1])
+            elif payload == "EA":
+                st = STATE.get(user_id, {})
+                st["step"] = "WAIT_ASUNTO"
+                STATE[user_id] = st
+                send_message(chat_id, "Escribe el asunto final:")
+            elif payload == "EC":
+                st = STATE.get(user_id, {})
+                st["step"] = "WAIT_CUERPO"
+                STATE[user_id] = st
+                send_message(chat_id, "Pega/escribe el cuerpo final del correo:")
+            elif payload == "CANCEL":
+                STATE.pop(user_id, None)
+                send_message(chat_id, "Cancelado. Usa /enviar para empezar de nuevo.")
+            elif payload == "SEND":
+                send_message(chat_id, "Perfecto. El flujo está listo ✅\nSiguiente paso: conectar el envío con tu Gmail institucional.")
+        except Exception as e:
+            send_message(chat_id, f"Error interno: {e}")
+
         return {"status": "ok"}
 
-    # Normal messages
     if "message" in data:
         msg = data["message"]
         user_id = msg["from"]["id"]
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
-<<<<<<< HEAD
 
-        if text in ("/start",):
+        if text == "/start":
             send_message(chat_id, "Bot funcionando correctamente 🚀\nUsa /enviar para comenzar.")
             return {"status": "ok"}
 
         if text == "/enviar":
-            start_flow(chat_id, user_id)
+            try:
+                start_flow(chat_id, user_id)
+            except Exception as e:
+                send_message(chat_id, f"Error leyendo Google Sheets: {e}")
             return {"status": "ok"}
 
         st = STATE.get(user_id, {})
@@ -302,47 +327,17 @@ async def telegram_webhook(request: Request):
             st["asunto"] = text
             st["step"] = "PREVIEW"
             STATE[user_id] = st
-            pick_template(chat_id, user_id, st.get("plantilla_id", ""))  # refresca preview
+            send_message(chat_id, "Listo (edición de asunto pendiente de ajustar). Usa /enviar por ahora.")
             return {"status": "ok"}
 
         if st.get("step") == "WAIT_CUERPO":
             st["cuerpo"] = text
             st["step"] = "PREVIEW"
             STATE[user_id] = st
-            pick_template(chat_id, user_id, st.get("plantilla_id", ""))  # refresca preview
+            send_message(chat_id, "Listo (edición de cuerpo pendiente de ajustar). Usa /enviar por ahora.")
             return {"status": "ok"}
 
         send_message(chat_id, "Usa /enviar para iniciar.")
         return {"status": "ok"}
 
     return {"status": "ok"}
-=======
-
-        if text in ("/start",):
-            send_message(chat_id, "Bot funcionando correctamente 🚀\nUsa /enviar para comenzar.")
-            return {"status": "ok"}
-
-        if text == "/enviar":
-            start_flow(chat_id, user_id)
-            return {"status": "ok"}
-
-        st = STATE.get(user_id, {})
-        if st.get("step") == "WAIT_ASUNTO":
-            st["asunto"] = text
-            st["step"] = "PREVIEW"
-            STATE[user_id] = st
-            pick_template(chat_id, user_id, st.get("plantilla_id", ""))  # refresca preview
-            return {"status": "ok"}
-
-        if st.get("step") == "WAIT_CUERPO":
-            st["cuerpo"] = text
-            st["step"] = "PREVIEW"
-            STATE[user_id] = st
-            pick_template(chat_id, user_id, st.get("plantilla_id", ""))  # refresca preview
-            return {"status": "ok"}
-
-        send_message(chat_id, "Usa /enviar para iniciar.")
-        return {"status": "ok"}
-
-    return {"status": "ok"}
->>>>>>> a7300cd33a3deae8112856412df23f1d94255d88
