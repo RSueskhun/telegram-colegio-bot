@@ -287,6 +287,7 @@ async def telegram_webhook(request: Request):
         user_id = msg["from"]["id"]
         chat_id = msg["chat"]["id"]
         text = (msg.get("text") or "").strip()
+<<<<<<< HEAD
 
         if text in ("/start",):
             send_message(chat_id, "Bot funcionando correctamente 🚀\nUsa /enviar para comenzar.")
@@ -315,3 +316,33 @@ async def telegram_webhook(request: Request):
         return {"status": "ok"}
 
     return {"status": "ok"}
+=======
+
+        if text in ("/start",):
+            send_message(chat_id, "Bot funcionando correctamente 🚀\nUsa /enviar para comenzar.")
+            return {"status": "ok"}
+
+        if text == "/enviar":
+            start_flow(chat_id, user_id)
+            return {"status": "ok"}
+
+        st = STATE.get(user_id, {})
+        if st.get("step") == "WAIT_ASUNTO":
+            st["asunto"] = text
+            st["step"] = "PREVIEW"
+            STATE[user_id] = st
+            pick_template(chat_id, user_id, st.get("plantilla_id", ""))  # refresca preview
+            return {"status": "ok"}
+
+        if st.get("step") == "WAIT_CUERPO":
+            st["cuerpo"] = text
+            st["step"] = "PREVIEW"
+            STATE[user_id] = st
+            pick_template(chat_id, user_id, st.get("plantilla_id", ""))  # refresca preview
+            return {"status": "ok"}
+
+        send_message(chat_id, "Usa /enviar para iniciar.")
+        return {"status": "ok"}
+
+    return {"status": "ok"}
+>>>>>>> a7300cd33a3deae8112856412df23f1d94255d88
